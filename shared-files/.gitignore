@@ -1,0 +1,12 @@
+# Dependencies
+node_modules/
+
+# Test/development folders
+Tz/
+test-folder-fix/
+test-upload.txt
+upload-test.txt
+api-test-folder-$(date +%s)/
+subdir/
+uploads/
+modal-test.js
