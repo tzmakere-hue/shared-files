@@ -10,6 +10,25 @@ const path = require('path');
 const url = require('url');
 const crypto = require('crypto');
 const { IncomingMessage } = require('stream');
+const Database = require('better-sqlite3');
+const Busboy = require('busboy');
+
+// WebDAV Server Setup (v2.x API)
+const webdavModule = require('webdav-server');
+let WebDAVV2, HTTPDigestAuthentication, SimpleUserManager, SimplePathPrivilegeManager;
+
+try {
+  // v2.x uses the .v2 namespace with a completely different architecture
+  const v2 = webdavModule.v2;
+  if (v2) {
+    WebDAVV2 = v2.WebDAVServer;
+    HTTPDigestAuthentication = v2.HTTPDigestAuthentication;
+    SimpleUserManager = v2.SimpleUserManager;
+    SimplePathPrivilegeManager = v2.SimplePathPrivilegeManager;
+  }
+} catch (e) {
+  console.warn('Failed to load WebDAV v2.x API:', e.message);
+}
 
 // Configuration
 const PORT = 9000;
@@ -17,14 +36,81 @@ const ROOT_DIR = process.env.FILE_MANAGER_ROOT || '/home/ubuntu/shared-files';
 const USERNAME = 'admin';
 const PASSWORD = 'admin123';
 
-// Session storage (in-memory)
-const sessions = new Map();
+// WebDAV configuration
+const WEBDAV_PORT = parseInt(process.env.WEBDAV_PORT) || 9001;
+const WEBDAV_ENABLED = process.env.WEBDAV_DISABLED !== 'true';
+
+// Session configuration
 const SESSION_LIFETIME_MS = 24 * 60 * 60 * 1000; // 24 hours session expiry
+
+// SQLite database for persistent sessions (use absolute path based on script location)
+const dbPath = process.env.SESSIONS_DB || path.join(__dirname, 'sessions.db');
+const db = new Database(dbPath);
+
+// Initialize sessions table
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    user TEXT NOT NULL,
+    created INTEGER NOT NULL,
+    last_access INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created);
+`);
+
+// Session management functions (database-backed)
+function createSession(user) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const now = Date.now();
+  
+  try {
+    db.prepare('INSERT INTO sessions (token, user, created, last_access) VALUES (?, ?, ?, ?)')
+      .run(token, user, now, now);
+    return token;
+  } catch (e) {
+    console.error('Failed to create session:', e);
+    return null;
+  }
+}
+
+function getSession(token) {
+  if (!token) return null;
+  
+  const session = db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
+  if (!session) return null;
+  
+  // Check expiry
+  if (Date.now() - session.created > SESSION_LIFETIME_MS) {
+    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    return null;
+  }
+  
+  // Update last_access
+  db.prepare('UPDATE sessions SET last_access = ? WHERE token = ?').run(Date.now(), token);
+  
+  return { user: session.user, created: session.created };
+}
+
+function deleteSession(token) {
+  db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+}
+
+// Periodic cleanup of expired sessions (every hour)
+setInterval(() => {
+  const expired = Date.now() - SESSION_LIFETIME_MS;
+  const result = db.prepare('DELETE FROM sessions WHERE created < ?').run(expired);
+  if (result.changes > 0) {
+    console.log('Cleaned up ' + result.changes + ' expired session(s)');
+  }
+}, 60 * 60 * 1000);
 
 // Rate limiting for login attempts
 const loginAttempts = new Map();
 const MAX_LOGIN_ATTEMPTS = 5;
 const LOGIN_LOCKOUT_MS = 5 * 60 * 1000; // 5 minutes lockout
+
+// Request size limit (100MB) to prevent DoS via large uploads
+const MAX_REQUEST_SIZE = 100 * 1024 * 1024;
 
 // Helper to parse multipart form data
 async function parseMultipart(req) {
@@ -37,9 +123,16 @@ async function parseMultipart(req) {
       return;
     }
     
-    // Read request body
+    // Read request body with size limit check
     let body = Buffer.alloc(0);
-    req.on('data', (chunk) => { body = Buffer.concat([body, chunk]); });
+    req.on('data', (chunk) => {
+      const newLength = body.length + chunk.length;
+      if (newLength > MAX_REQUEST_SIZE) {
+        req.destroy();
+        return;
+      }
+      body = Buffer.concat([body, chunk]);
+    });
     req.on('end', () => {
       try {
         const boundaryStr = boundaryMatch[1];
@@ -92,6 +185,11 @@ async function parseMultipart(req) {
     });
     req.on('error', reject);
   });
+}
+
+// Helper to check request size exceeded
+function isRequestTooLarge(bodyLength) {
+  return bodyLength > MAX_REQUEST_SIZE;
 }
 
 // Generate session token
@@ -226,7 +324,7 @@ e.preventDefault();
 const formData = new FormData(e.target);
 const response = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: formData.get('user'), pass: formData.get('pass') }) });
 const data = await response.json();
-if (data.success) { document.cookie = 'session=' + data.session + '; path=/'; window.location.href = '/?path=/'; }
+if (data.success) { document.cookie = 'session=' + data.session + '; path=/; max-age=86400; SameSite=Strict'; window.location.href = '/?path=/'; }
 else { document.getElementById('error').style.display = 'block'; }
 });
 </script>
@@ -289,7 +387,15 @@ button:hover { background: #ff6b6b; }
 .container { padding: 30px; max-width: 1200px; margin: 0 auto; }
 .toolbar { display: flex; gap: 15px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; }
 .path-input { flex: 1; min-width: 300px; padding: 10px 15px; background: #16213e; border: 1px solid #0f3460; color: #fff; border-radius: 4px; font-size: 14px; }
-.file-list { width: 100%; border-collapse: collapse; }
+.table-container {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.file-list {
+  min-width: 600px;
+  border-collapse: collapse;
+}
 .file-list th, .file-list td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #16213e; }
 .file-list th { background: #16213e; color: #888; font-weight: normal; font-size: 12px; text-transform: uppercase; }
 .file-list tr:hover { background: #16213e; }
@@ -300,6 +406,54 @@ button:hover { background: #ff6b6b; }
 .modified { color: #888; width: 180px; }
 .actions { display: flex; gap: 5px; }
 .btn-sm { padding: 4px 8px; font-size: 12px; margin-right: 5px; }
+
+/* Accessibility focus styles */
+button:focus-visible,
+input:focus-visible,
+a:focus-visible {
+  outline: 2px solid #e94560;
+  outline-offset: 2px;
+}
+
+/* Mobile responsive styles */
+@media (max-width: 768px) {
+  .container { padding: 15px; }
+  
+  .toolbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+  
+  .path-input {
+    min-width: auto;
+    order: 3;
+    margin-top: 5px;
+  }
+  
+  .breadcrumb {
+    font-size: 14px;
+    word-break: break-all;
+  }
+  
+  .file-list {
+    font-size: 12px;
+  }
+  
+  .file-list th, .file-list td {
+    padding: 8px 5px;
+  }
+  
+  .actions {
+    flex-direction: column;
+    gap: 3px;
+  }
+  
+  .btn-sm {
+    padding: 4px 8px;
+    font-size: 11px;
+  }
+}
 .btn-download { background: #4CAF50; }
 .btn-delete { background: #f44336; }
 .btn-rename { background: #ff9800; }
@@ -345,17 +499,35 @@ a { text-decoration: none; }
 </div>
 <div id="progressBar" class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
 <div id="statusMsg" class="status-msg"></div>
+<div class="table-container">
 <table class="file-list">
 <thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Actions</th></tr></thead>
 <tbody id="fileListBody">${rowsHtml}</tbody>
 </table>
-</div>
+</div></div>
 <div id="renameModal" class="modal-overlay hidden"><div class="modal"><h3>Rename</h3><input type="text" id="newNameInput"><div class="modal-buttons"><button class="btn-cancel" onclick="closeRename()">Cancel</button><button onclick="confirmRename()">Rename</button></div></div></div>
 <div id="folderModal" class="modal-overlay hidden"><div class="modal"><h3>New Folder Name</h3><input type="text" id="folderNameInput" placeholder="Enter folder name"><div class="modal-buttons"><button class="btn-cancel" onclick="closeFolderModal()">Cancel</button><button onclick="confirmCreateFolder()">Create</button></div></div></div>
 <div id="uploadModal" class="modal-overlay hidden"><div class="modal"><h3>Upload Files</h3><p style="color: #888; margin-bottom: 15px;">Select files to upload to current folder</p><input type="file" id="modalFileInput" multiple style="width: 100%; padding: 10px; background: #0f3460; border: none; color: #fff; border-radius: 4px; margin-bottom: 15px;"><div id="uploadProgress" style="color: #888; margin-bottom: 15px;"></div><div class="modal-buttons"><button class="btn-cancel" onclick="closeUploadModal()">Cancel</button><button onclick="startUpload()" id="uploadBtn" disabled>Upload</button></div></div></div>
 <script>
 const currentPath = '${h(currentPath)}';
 let renamingPath = null;
+
+// Determine if file should use streaming upload (>10MB threshold)
+function shouldUseStreaming(file) {
+  return file.size > 10 * 1024 * 1024; // Use streaming for files > 10MB
+}
+
+// User-friendly error message mapping
+function userFriendlyError(technicalError) {
+  const mappings = {
+    'Invalid credentials': 'Wrong username or password',
+    'Too many login attempts': 'Too many failed logins. Try again in 5 minutes.',
+    'Invalid request': 'Please check your input and try again',
+    'File not found': 'The file does not exist',
+    'Access Denied': 'You do not have permission to access this resource'
+  };
+  return mappings[technicalError] || 'An error occurred. Please try again.';
+}
 
 function formatSize(bytes) {
 if (bytes === 0) return '0 B';
@@ -365,18 +537,94 @@ return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
 }
 
 function navigate(path) { window.location.href = '/?path=' + encodeURIComponent(path); }
-function logout() { fetch('/api/auth/logout', { method: 'POST' }); window.location.href = '/'; }
+function logout() {
+  document.cookie = 'session=; path=/; expires=' + new Date(0).toUTCString();
+  fetch('/api/auth/logout', { method: 'POST' });
+  window.location.href = '/';
+}
 
 async function uploadFile(file, index, total) {
 const formData = new FormData();
 formData.append('file', file);
-const response = await fetch('/api/upload?path=' + encodeURIComponent(currentPath), { method: 'POST', body: formData });
-const data = await response.json();
-updateProgress(index, total);
-if (!data.success) {
-  showStatus('Failed to upload "' + file.name + '": ' + (data.error || 'Unknown error'), true);
+
+// Use streaming for large files (>10MB), buffered upload for small files
+const useStreaming = shouldUseStreaming(file);
+const endpoint = useStreaming ? '/api/upload-stream?path=' + encodeURIComponent(currentPath) : '/api/upload?path=' + encodeURIComponent(currentPath);
+const displaySize = formatSize(file.size);
+
+try {
+  if (useStreaming && 'XMLHttpRequest' in window) {
+    // Use XHR for streaming uploads to get progress events
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      
+      xhr.open('POST', endpoint, true);
+      
+      // Update progress bar during upload
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) {
+          const percentComplete = Math.round((e.loaded / e.total) * 100);
+          showStatus('Uploading ' + file.name + ': ' + percentComplete + '% (' + formatSize(e.loaded) + ' of ' + displaySize + ')', false);
+        }
+      });
+      
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            const data = JSON.parse(xhr.responseText);
+            updateProgress(index, total);
+            if (data.success) {
+              showStatus('Uploaded ' + file.name + ' (' + formatSize(data.size || file.size) + ')', false);
+              resolve(true);
+            } else {
+              showStatus('Failed to upload "' + file.name + '": ' + userFriendlyError(data.error || 'Unknown error'), true);
+              updateProgress(index, total);
+              resolve(false);
+            }
+          } catch (parseErr) {
+            showStatus('Response parse error for "' + file.name + '"', true);
+            updateProgress(index, total);
+            resolve(false);
+          }
+        } else {
+          showStatus('HTTP ' + xhr.status + ' uploading "' + file.name + '"', true);
+          updateProgress(index, total);
+          resolve(false);
+        }
+      });
+      
+      xhr.addEventListener('error', () => {
+        showStatus('Network error uploading "' + file.name + '"', true);
+        updateProgress(index, total);
+        resolve(false);
+      });
+      
+      xhr.addEventListener('abort', () => {
+        showStatus('Upload aborted: "' + file.name + '"', true);
+        updateProgress(index, total);
+        resolve(false);
+      });
+      
+      xhr.send(formData);
+    });
+  } else {
+    // Use fetch for small files (no progress tracking needed)
+    const response = await fetch(endpoint, { method: 'POST', body: formData });
+    if (!response.ok) { throw new Error('HTTP ' + response.status + ': ' + response.statusText); }
+    const data = await response.json();
+    updateProgress(index, total);
+    if (!data.success) {
+      showStatus('Failed to upload "' + file.name + '": ' + userFriendlyError(data.error || 'Unknown error'), true);
+    } else {
+      showStatus('Uploaded ' + file.name + ' (' + displaySize + ')', false);
+    }
+    return data.success;
+  }
+} catch (e) {
+  updateProgress(index, total);
+  showStatus('Network error uploading "' + file.name + '"', true);
+  return false;
 }
-return data.success;
 }
 
 async function handleFiles(files) {
@@ -399,9 +647,14 @@ setTimeout(() => { el.style.display = 'none'; }, 3000);
 function download(filePath) { window.location.href = '/download?path=' + encodeURIComponent(filePath); }
 async function deleteItem(filePath) {
 if (!confirm('Delete "' + filePath.split('/').pop() + '"?')) return;
-const response = await fetch('/api/delete', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ path: filePath })});
-const data = await response.json();
-if (data.success) window.location.reload(); else showStatus(data.error, true);
+try {
+  const response = await fetch('/api/delete', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ path: filePath })});
+  if (!response.ok) { throw new Error('HTTP ' + response.status + ': ' + response.statusText); }
+  const data = await response.json();
+  if (data.success) window.location.reload(); else showStatus(userFriendlyError(data.error), true);
+} catch (e) {
+  showStatus('Network error during delete', true);
+}
 }
 
 function renameItem(filePath, currentName) {
@@ -414,10 +667,15 @@ function closeRename() { document.getElementById('renameModal').classList.add('h
 async function confirmRename() {
 const newName = document.getElementById('newNameInput').value.trim();
 if (!newName) return;
-const response = await fetch('/api/rename', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ path: renamingPath, newName })});
-const data = await response.json();
-closeRename();
-if (data.success) window.location.reload(); else showStatus(data.error, true);
+try {
+  const response = await fetch('/api/rename', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ path: renamingPath, newName })});
+  if (!response.ok) { throw new Error('HTTP ' + response.status + ': ' + response.statusText); }
+  const data = await response.json();
+  closeRename();
+  if (data.success) window.location.reload(); else showStatus(userFriendlyError(data.error), true);
+} catch (e) {
+  showStatus('Network error during rename', true);
+}
 }
 
 // Modal state management
@@ -448,17 +706,60 @@ async function startUpload() {
   
   if (!files.length) { showStatus('No files selected', true); return; }
   
+  let successCount = 0;
+  
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
     const formData = new FormData();
     formData.append('file', file);
+    const displaySize = formatSize(file.size);
     
-    document.getElementById('uploadProgress').innerHTML = '<p>Uploading ' + (i+1) + '/' + files.length + ': ' + file.name + '...</p>';
+    // Use streaming for large files
+    const useStreaming = shouldUseStreaming(file);
+    const endpoint = useStreaming ? '/api/upload-stream?path=' + encodeURIComponent(currentPath) : '/api/upload?path=' + encodeURIComponent(currentPath);
+    
+    document.getElementById('uploadProgress').innerHTML = '<p>Uploading ' + (i+1) + '/' + files.length + ': <strong>' + file.name + '</strong> (' + displaySize + ')' + (useStreaming ? ' [streaming]' : '') + '...</p>';
     
     try {
-      const response = await fetch('/api/upload?path=' + encodeURIComponent(currentPath), { method: 'POST', body: formData });
-      const data = await response.json();
-      if (!data.success) throw new Error(data.error || 'Upload failed');
+      if (useStreaming && 'XMLHttpRequest' in window) {
+        // Use XHR for streaming uploads with progress
+        await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST', endpoint, true);
+          
+          xhr.upload.addEventListener('progress', (e) => {
+            if (e.lengthComputable) {
+              const percentComplete = Math.round((e.loaded / e.total) * 100);
+              document.getElementById('uploadProgress').innerHTML = '<p>Uploading ' + (i+1) + '/' + files.length + ': <strong>' + file.name + '</strong>: ' + percentComplete + '% (' + formatSize(e.loaded) + ' of ' + displaySize + ')</p>';
+            }
+          });
+          
+          xhr.addEventListener('load', () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+              try {
+                const data = JSON.parse(xhr.responseText);
+                resolve(data.success);
+              } catch (parseErr) {
+                reject(new Error('Response parse error'));
+              }
+            } else {
+              reject(new Error('HTTP ' + xhr.status));
+            }
+          });
+          
+          xhr.addEventListener('error', () => reject(new Error('Network error')));
+          xhr.addEventListener('abort', () => reject(new Error('Aborted')));
+          
+          xhr.send(formData);
+        });
+      } else {
+        // Use fetch for small files
+        const response = await fetch(endpoint, { method: 'POST', body: formData });
+        if (!response.ok) { throw new Error('HTTP ' + response.status + ': ' + response.statusText); }
+        const data = await response.json();
+        if (!data.success) throw new Error(data.error || 'Upload failed');
+      }
+      successCount++;
     } catch (error) {
       showStatus('Failed to upload ' + file.name + ': ' + error.message, true);
       continue;
@@ -466,7 +767,11 @@ async function startUpload() {
   }
   
   closeUploadModal();
-  showStatus(files.length + ' file(s) uploaded successfully', false);
+  if (successCount === files.length) {
+    showStatus(files.length + ' file(s) uploaded successfully', false);
+  } else if (successCount > 0) {
+    showStatus(successCount + '/' + files.length + ' file(s) uploaded successfully', false);
+  }
   window.location.reload();
 }
 
@@ -517,15 +822,24 @@ function closeFolderModal() {
 async function confirmCreateFolder() {
 const folderName = document.getElementById('folderNameInput').value.trim();
 if (!folderName) { showStatus('Please enter a folder name', true); return; }
-const response = await fetch('/api/mkdir', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ path: currentPath, name: folderName })});
-const data = await response.json();
-closeFolderModal();
-if (data.success) window.location.reload(); else showStatus(data.error, true);
+try {
+  const response = await fetch('/api/mkdir', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ path: currentPath, name: folderName })});
+  if (!response.ok) { throw new Error('HTTP ' + response.status + ': ' + response.statusText); }
+  const data = await response.json();
+  closeFolderModal();
+  if (data.success) window.location.reload(); else showStatus(userFriendlyError(data.error), true);
+} catch (e) {
+  showStatus('Network error creating folder', true);
+}
 }
 
 document.getElementById('uploadArea').addEventListener('click', () => document.getElementById('fileInput').click());
 document.getElementById('uploadArea').addEventListener('dragover', (e) => { e.preventDefault(); e.currentTarget.classList.add('dragover'); });
-document.getElementById('uploadArea').addEventListener('dragleave', () => document.getElementById('uploadArea').classList.remove('dragover'));
+document.getElementById('uploadArea').addEventListener('dragleave', (e) => {
+if (e.target === e.currentTarget) {
+  document.getElementById('uploadArea').classList.remove('dragover');
+}
+});
 document.getElementById('uploadArea').addEventListener('drop', (e) => {
 e.preventDefault(); document.getElementById('uploadArea').classList.remove('dragover'); handleFiles(e.dataTransfer.files);
 });
@@ -533,13 +847,15 @@ document.getElementById('fileInput').addEventListener('change', (e) => handleFil
 document.getElementById('newNameInput').addEventListener('keypress', (e) => { if (e.key === 'Enter') confirmRename(); });
 document.getElementById('folderNameInput').addEventListener('keypress', (e) => { if (e.key === 'Enter') confirmCreateFolder(); });
 
-// ESC key closes both modals
+// ESC key closes all modals
 document.addEventListener('keydown', (e) => {
 if (e.key === 'Escape') {
 const renameModal = document.getElementById('renameModal');
 const folderModal = document.getElementById('folderModal');
+const uploadModal = document.getElementById('uploadModal');
 if (!renameModal.classList.contains('hidden')) closeRename();
 if (!folderModal.classList.contains('hidden')) closeFolderModal();
+if (!uploadModal.classList.contains('hidden')) closeUploadModal();
 }
 });
 
@@ -568,17 +884,26 @@ document.addEventListener('DOMContentLoaded', function() {
 function checkAuth(req) {
   const cookie = req.headers.cookie || '';
   const sessionMatch = cookie.match(/session=([^;]+)/);
-  if (sessionMatch && sessions.has(sessionMatch[1])) {
-    const sessionData = sessions.get(sessionMatch[1]);
-    // Check for session expiry
-    if (Date.now() - sessionData.created > SESSION_LIFETIME_MS) {
-      sessions.delete(sessionMatch[1]); // Clean up expired session
-      return false;
-    }
-    return true;
+  if (sessionMatch) {
+    const sessionData = getSession(sessionMatch[1]);
+    // getSession handles expiry and cleanup internally
+    return !!sessionData;
   }
   return false;
 }
+
+// Error codes enum for consistent error responses
+const ERROR_CODES = {
+  UNAUTHORIZED: 'UNAUTHORIZED',
+  ACCESS_DENIED: 'ACCESS_DENIED',
+  NOT_FOUND: 'NOT_FOUND',
+  INVALID_REQUEST: 'INVALID_REQUEST',
+  FILE_EXISTS: 'FILE_EXISTS',
+  INVALID_FILENAME: 'INVALID_FILENAME',
+  PAYLOAD_TOO_LARGE: 'PAYLOAD_TOO_LARGE',
+  RATE_LIMITED: 'RATE_LIMITED',
+  INTERNAL_ERROR: 'INTERNAL_ERROR'
+};
 
 // Response helper
 function sendJSON(res, data) {
@@ -591,13 +916,74 @@ function sendHTML(res, html) {
   res.end(html);
 }
 
+// V1 API Response helpers with consistent format
+function sendV1Success(res, statusCode, data, meta = null) {
+  const response = {
+    status: 'success',
+    data: data
+  };
+  if (meta !== null) {
+    response.meta = meta;
+  }
+  res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(response));
+}
+
+function sendV1Error(res, statusCode, code, message) {
+  res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    status: 'error',
+    code: code,
+    message: message
+  }));
+}
+
+// Session check (legacy)
+function checkSession(req, res) {
+  const cookie = req.headers.cookie || '';
+  const sessionMatch = cookie.match(/session=([^;]+)/);
+  if (!sessionMatch || !getSession(sessionMatch[1])) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: false, error: 'Unauthorized' }));
+    return false;
+  }
+  return true;
+}
+
+// Session check with V1 error response
+function checkSessionV1(req, res) {
+  const cookie = req.headers.cookie || '';
+  const sessionMatch = cookie.match(/session=([^;]+)/);
+  if (!sessionMatch || !getSession(sessionMatch[1])) {
+    sendV1Error(res, 401, ERROR_CODES.UNAUTHORIZED, 'Authentication required');
+    return false;
+  }
+  return true;
+}
+
+// Helper to extract path from V1 file endpoints (returns path with leading /)
+function extractPathFromV1Endpoint(pathname, prefixLength) {
+  let encodedPath = pathname.substring(prefixLength);
+  // Ensure path always starts with /
+  if (!encodedPath || encodedPath === '/') {
+    return '/';
+  }
+  if (!encodedPath.startsWith('/')) {
+    encodedPath = '/' + encodedPath;
+  }
+  return decodeURIComponent(encodedPath);
+}
+
 // Main server
 const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url);
   const pathname = parsedUrl.pathname;
   
-  // API: Login
+  // API: Login (deprecated - use /api/v1/auth/login)
   if (pathname === '/api/auth/login' && req.method === 'POST') {
+    res.setHeader('Deprecation', 'true');
+    res.setHeader('X-Deprecation-Warning', 'Use /api/v1/auth/login instead');
+    
     let body = '';
     for await (const chunk of req) body += chunk;
     
@@ -619,8 +1005,12 @@ const server = http.createServer(async (req, res) => {
       recordLoginAttempt(clientIP, valid); // Record attempt (success or failure)
       
       if (valid) {
-        const session = generateSessionToken();
-        sessions.set(session, { user, created: Date.now() });
+        const session = createSession(user);
+        if (!session) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'Failed to create session' }));
+          return;
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, session }));
       } else {
@@ -637,10 +1027,321 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/api/auth/logout' && req.method === 'POST') {
     const cookie = req.headers.cookie || '';
     const sessionMatch = cookie.match(/session=([^;]+)/);
-    if (sessionMatch) sessions.delete(sessionMatch[1]);
+    if (sessionMatch) deleteSession(sessionMatch[1]);
     res.writeHead(200).end('OK');
     return;
   }
+
+  // ========== V1 API ENDPOINTS ==========
+
+  // V1: Login - POST /api/v1/auth/login
+  if (pathname === '/api/v1/auth/login' && req.method === 'POST') {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    
+    const clientIP = req.socket.remoteAddress || 
+                     req.headers['x-forwarded-for']?.split(',')[0] || 
+                     'unknown';
+    
+    if (isLoginRateLimited(clientIP)) {
+      sendV1Error(res, 429, ERROR_CODES.RATE_LIMITED, 'Too many login attempts. Please try again later.');
+      return;
+    }
+    
+    try {
+      const { user, pass } = JSON.parse(body);
+      const valid = validateCredentials(user, pass);
+      recordLoginAttempt(clientIP, valid);
+      
+      if (valid) {
+        const session = createSession(user);
+        if (!session) {
+          sendV1Error(res, 500, ERROR_CODES.INTERNAL_ERROR, 'Failed to create session');
+          return;
+        }
+        sendV1Success(res, 200, { session });
+      } else {
+        sendV1Error(res, 401, ERROR_CODES.UNAUTHORIZED, 'Invalid credentials');
+      }
+    } catch (e) {
+      sendV1Error(res, 400, ERROR_CODES.INVALID_REQUEST, 'Malformed request body');
+    }
+    return;
+  }
+
+  // V1: Logout - POST /api/v1/auth/logout
+  if (pathname === '/api/v1/auth/logout' && req.method === 'POST') {
+    const cookie = req.headers.cookie || '';
+    const sessionMatch = cookie.match(/session=([^;]+)/);
+    if (sessionMatch) deleteSession(sessionMatch[1]);
+    res.writeHead(204); // No Content
+    res.end();
+    return;
+  }
+
+  // V1: Raw file download - GET /api/v1/files/{path*}/raw
+  // Must come BEFORE general /api/v1/files handler to avoid being caught first
+  if (pathname.startsWith('/api/v1/files') && pathname.endsWith('/raw')) {
+    if (!checkSessionV1(req, res)) return;
+    
+    const pathWithoutRaw = pathname.substring(0, pathname.length - 4); // Remove '/raw'
+    const decodedPath = extractPathFromV1Endpoint(pathWithoutRaw, 14);
+    const resolvedPath = safePath(decodedPath);
+    
+    if (!resolvedPath) {
+      sendV1Error(res, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
+      return;
+    }
+    
+    try {
+      const stat = fs.statSync(resolvedPath);
+      if (!stat.isFile()) {
+        sendV1Error(res, 400, ERROR_CODES.INVALID_REQUEST, 'Not a file');
+        return;
+      }
+      
+      const filename = path.basename(resolvedPath);
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': 'attachment; filename="' + filename + '"',
+        'Content-Length': stat.size
+      });
+      fs.createReadStream(resolvedPath).pipe(res);
+    } catch (e) {
+      if (e.code === 'ENOENT') {
+        sendV1Error(res, 404, ERROR_CODES.NOT_FOUND, 'File not found');
+      } else {
+        sendV1Error(res, 500, ERROR_CODES.INTERNAL_ERROR, e.message);
+      }
+    }
+    return;
+  }
+
+  // V1: File operations - /api/v1/files/{path*}
+  if (pathname.startsWith('/api/v1/files')) {
+    if (!checkSessionV1(req, res)) return;
+    
+    const decodedPath = extractPathFromV1Endpoint(pathname, 14); // 14 = length of '/api/v1/files'
+    const resolvedPath = safePath(decodedPath);
+    
+    if (!resolvedPath) {
+      sendV1Error(res, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
+      return;
+    }
+    
+    // V1: List files - GET /api/v1/files/{path*}
+    if (req.method === 'GET') {
+      try {
+        const entries = fs.readdirSync(resolvedPath, { withFileTypes: true });
+        const files = entries.map(entry => {
+          const fullPath = path.join(resolvedPath, entry.name);
+          let stat;
+          try {
+            stat = fs.statSync(fullPath);
+          } catch (e) {
+            return null; // Skip broken symlinks
+          }
+          
+          return {
+            name: entry.name,
+            path: decodedPath === '/' ? '/' + entry.name : decodedPath + '/' + entry.name,
+            isDirectory: entry.isDirectory(),
+            size: entry.isDirectory() ? 0 : stat.size,
+            modified: stat.mtime.toISOString()
+          };
+        }).filter(f => f !== null);
+        
+        sendV1Success(res, 200, files, { path: decodedPath, count: files.length });
+      } catch (e) {
+        if (e.code === 'ENOENT') {
+          sendV1Error(res, 404, ERROR_CODES.NOT_FOUND, 'Path not found');
+        } else {
+          sendV1Error(res, 500, ERROR_CODES.INTERNAL_ERROR, e.message);
+        }
+      }
+      return;
+    }
+    
+    // V1: Upload file - POST /api/v1/files/{path*}
+    if (req.method === 'POST') {
+      try {
+        const parsed = await parseMultipart(req);
+        
+        if (!parsed.file) {
+          sendV1Error(res, 400, ERROR_CODES.INVALID_REQUEST, 'No file uploaded');
+          return;
+        }
+        
+        const sanitizedFilename = sanitizeFilename(parsed.file.originalname);
+        if (!sanitizedFilename) {
+          sendV1Error(res, 400, ERROR_CODES.INVALID_FILENAME, 'Invalid filename');
+          return;
+        }
+        
+        const targetDir = resolvedPath;
+        fs.mkdirSync(targetDir, { recursive: true });
+        
+        const finalPath = path.join(targetDir, sanitizedFilename);
+        
+        // Check if file already exists
+        try {
+          fs.accessSync(finalPath);
+          sendV1Error(res, 409, ERROR_CODES.FILE_EXISTS, 'File already exists');
+          return;
+        } catch (e) {
+          // File doesn't exist, proceed with upload
+        }
+        
+        fs.writeFileSync(finalPath, parsed.file.buffer);
+        const stat = fs.statSync(finalPath);
+        
+        console.log(`V1 Upload: ${parsed.file.originalname} (${sanitizedFilename}) → ${finalPath}`);
+        sendV1Success(res, 201, {
+          name: sanitizedFilename,
+          originalName: parsed.file.originalname,
+          path: decodedPath === '/' ? '/' + sanitizedFilename : decodedPath + '/' + sanitizedFilename,
+          size: stat.size,
+          created: stat.mtime.toISOString()
+        });
+      } catch (error) {
+        console.error('V1 Upload error:', error);
+        sendV1Error(res, 500, ERROR_CODES.INTERNAL_ERROR, error.message);
+      }
+      return;
+    }
+    
+    // V1: Create folder - PUT /api/v1/files/{path*}
+    if (req.method === 'PUT') {
+      try {
+        fs.mkdirSync(resolvedPath, { recursive: true });
+        const stat = fs.statSync(resolvedPath);
+        sendV1Success(res, 201, {
+          name: path.basename(decodedPath),
+          path: decodedPath,
+          isDirectory: true,
+          created: stat.mtime.toISOString()
+        });
+      } catch (e) {
+        if (e.code === 'EEXIST') {
+          sendV1Error(res, 409, ERROR_CODES.FILE_EXISTS, 'Folder already exists');
+        } else {
+          sendV1Error(res, 500, ERROR_CODES.INTERNAL_ERROR, e.message);
+        }
+      }
+      return;
+    }
+    
+    // V1: Delete - DELETE /api/v1/files/{path*}
+    if (req.method === 'DELETE') {
+      try {
+        const stat = fs.statSync(resolvedPath);
+        if (stat.isDirectory()) {
+          fs.rmSync(resolvedPath, { recursive: true, force: true });
+        } else {
+          fs.unlinkSync(resolvedPath);
+        }
+        res.writeHead(204); // No Content
+        res.end();
+      } catch (e) {
+        if (e.code === 'ENOENT') {
+          sendV1Error(res, 404, ERROR_CODES.NOT_FOUND, 'File not found');
+        } else {
+          sendV1Error(res, 500, ERROR_CODES.INTERNAL_ERROR, e.message);
+        }
+      }
+      return;
+    }
+    
+    // V1: Rename - PATCH /api/v1/files/{path*}
+    if (req.method === 'PATCH') {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      
+      try {
+        const { newName } = JSON.parse(body);
+        
+        if (!newName) {
+          sendV1Error(res, 400, ERROR_CODES.INVALID_REQUEST, 'Missing newName field');
+          return;
+        }
+        
+        const sanitizedNewName = sanitizeFilename(newName);
+        if (!sanitizedNewName) {
+          sendV1Error(res, 400, ERROR_CODES.INVALID_FILENAME, 'Invalid filename');
+          return;
+        }
+        
+        const dir = path.dirname(resolvedPath);
+        const newFullPath = path.join(dir, sanitizedNewName);
+        
+        if (!safePath(newFullPath)) {
+          sendV1Error(res, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
+          return;
+        }
+        
+        fs.renameSync(resolvedPath, newFullPath);
+        const stat = fs.statSync(newFullPath);
+        
+        sendV1Success(res, 200, {
+          name: sanitizedNewName,
+          path: '/' + path.relative(ROOT_DIR, newFullPath),
+          isDirectory: stat.isDirectory(),
+          size: stat.isDirectory() ? 0 : stat.size,
+          modified: stat.mtime.toISOString()
+        });
+      } catch (e) {
+        if (e.code === 'ENOENT') {
+          sendV1Error(res, 404, ERROR_CODES.NOT_FOUND, 'File not found');
+        } else {
+          sendV1Error(res, 500, ERROR_CODES.INTERNAL_ERROR, e.message);
+        }
+      }
+      return;
+    }
+    
+    // Method not allowed
+    sendV1Error(res, 400, ERROR_CODES.INVALID_REQUEST, 'Method not allowed');
+    return;
+  }
+
+  // V1: Raw file download - GET /api/v1/files/{path*}/raw
+  if (pathname.startsWith('/api/v1/files') && pathname.endsWith('/raw')) {
+    if (!checkSessionV1(req, res)) return;
+    
+    const pathWithoutRaw = pathname.substring(0, pathname.length - 4); // Remove '/raw'
+    const decodedPath = extractPathFromV1Endpoint(pathWithoutRaw, 14);
+    const resolvedPath = safePath(decodedPath);
+    
+    if (!resolvedPath) {
+      sendV1Error(res, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
+      return;
+    }
+    
+    try {
+      const stat = fs.statSync(resolvedPath);
+      if (!stat.isFile()) {
+        sendV1Error(res, 400, ERROR_CODES.INVALID_REQUEST, 'Not a file');
+        return;
+      }
+      
+      const filename = path.basename(resolvedPath);
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': 'attachment; filename="' + filename + '"',
+        'Content-Length': stat.size
+      });
+      fs.createReadStream(resolvedPath).pipe(res);
+    } catch (e) {
+      if (e.code === 'ENOENT') {
+        sendV1Error(res, 404, ERROR_CODES.NOT_FOUND, 'File not found');
+      } else {
+        sendV1Error(res, 500, ERROR_CODES.INTERNAL_ERROR, e.message);
+      }
+    }
+    return;
+  }
+
+  // ========== END V1 API ENDPOINTS ==========
   
   // Check auth for protected routes
   if (!checkAuth(req)) {
@@ -674,8 +1375,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   
-  // Download
+  // Download (deprecated - use /api/v1/files/{path}/raw)
   if (pathname === '/download') {
+    res.setHeader('Deprecation', 'true');
+    res.setHeader('X-Deprecation-Warning', 'Use /api/v1/files/{path}/raw instead');
+    
     const query = url.parse(req.url, true).query;
     const resolvedPath = safePath(query.path);
     
@@ -704,8 +1408,101 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   
-  // API: Upload (manual multipart parsing)
+  // API: Streaming Upload - deprecated (use /api/v1/files/{path} POST)
+  if (pathname === '/api/upload-stream' && req.method === 'POST') {
+    res.setHeader('Deprecation', 'true');
+    res.setHeader('X-Deprecation-Warning', 'Use /api/v1/files/{path} with POST method instead');
+    
+    if (!checkSession(req, res)) return;
+    
+    const query = url.parse(req.url, true).query;
+    let targetPath = query.path || '/';
+    
+    // Handle encoded path properly
+    if (targetPath.startsWith('%2F')) {
+      targetPath = decodeURIComponent(targetPath);
+    } else if (targetPath !== '/') {
+      targetPath = '/' + targetPath;
+    }
+    
+    const targetDir = safePath(targetPath);
+    if (!targetDir) { sendJSON(res, { success: false, error: 'Invalid path' }); return; }
+    
+    // Ensure directory exists
+    try {
+      fs.mkdirSync(targetDir, { recursive: true });
+    } catch (e) {
+      sendJSON(res, { success: false, error: e.message });
+      return;
+    }
+    
+    const busboy = new Busboy({ headers: req.headers });
+    let writeFileStream = null;
+    let bytesWritten = 0;
+    let filename = '';
+    let originalFilename = '';
+    
+    busboy.on('file', (fieldname, fileStream, info) => {
+      originalFilename = decodeURIComponent(info.filename);
+      filename = sanitizeFilename(originalFilename);
+      if (!filename) { req.destroy(); return; }
+      
+      const finalPath = path.join(targetDir, filename);
+      
+      // Verify path is within bounds
+      const resolvedFinalPath = path.resolve(finalPath);
+      if (!resolvedFinalPath.startsWith(ROOT_DIR + '/') && resolvedFinalPath !== ROOT_DIR) {
+        sendJSON(res, { success: false, error: 'Access Denied' });
+        req.destroy();
+        return;
+      }
+      
+      try {
+        writeFileStream = fs.createWriteStream(finalPath);
+        fileStream.pipe(writeFileStream);
+        
+        // Track bytes written
+        fileStream.on('data', (chunk) => {
+          bytesWritten += chunk.length;
+        });
+        
+        writeFileStream.on('finish', () => {
+          console.log(`Streaming upload: ${originalFilename} (${filename}) → ${finalPath}, size: ${bytesWritten}`);
+          sendJSON(res, { success: true, filename, original: originalFilename, size: bytesWritten });
+        });
+        
+        writeFileStream.on('error', (err) => {
+          console.error(`Stream write error: ${err.message}`);
+          if (!res.headersSent) {
+            sendJSON(res, { success: false, error: err.message });
+          }
+          req.destroy();
+        });
+      } catch (e) {
+        console.error(`Stream setup error: ${e.message}`);
+        if (!res.headersSent) {
+          sendJSON(res, { success: false, error: e.message });
+        }
+        req.destroy();
+      }
+    });
+    
+    busboy.on('error', (err) => {
+      console.error(`Busboy error: ${err.message}`);
+      if (!res.headersSent) {
+        sendJSON(res, { success: false, error: err.message });
+      }
+    });
+    
+    req.pipe(busboy);
+    return;
+  }
+  
+  // API: Upload (deprecated - use /api/v1/files/{path} POST)
   if (pathname === '/api/upload' && req.method === 'POST') {
+    res.setHeader('Deprecation', 'true');
+    res.setHeader('X-Deprecation-Warning', 'Use /api/v1/files/{path} with POST method instead');
+    
     try {
       // Parse multipart form data
       const parsed = await parseMultipart(req);
@@ -761,8 +1558,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   
-  // API: Delete
+  // API: Delete (deprecated - use /api/v1/files/{path} DELETE)
   if (pathname === '/api/delete' && req.method === 'POST') {
+    res.setHeader('Deprecation', 'true');
+    res.setHeader('X-Deprecation-Warning', 'Use /api/v1/files/{path} with DELETE method instead');
+    
     let body = '';
     for await (const chunk of req) body += chunk;
     const { path: filePath } = JSON.parse(body);
@@ -789,8 +1589,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   
-  // API: Rename
+  // API: Rename (deprecated - use /api/v1/files/{path} PATCH)
   if (pathname === '/api/rename' && req.method === 'POST') {
+    res.setHeader('Deprecation', 'true');
+    res.setHeader('X-Deprecation-Warning', 'Use /api/v1/files/{path} with PATCH method instead');
+    
     let body = '';
     for await (const chunk of req) body += chunk;
     const { path: oldPath, newName } = JSON.parse(body);
@@ -801,9 +1604,23 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     
+    // Sanitize new filename to prevent directory traversal and injection
+    const sanitizedNewName = sanitizeFilename(newName);
+    if (!sanitizedNewName) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: 'Invalid filename' }));
+      return;
+    }
+    
     try {
       const dir = path.dirname(resolvedOldPath);
-      const newFullPath = path.join(dir, newName);
+      const newFullPath = path.join(dir, sanitizedNewName);
+      // Re-validate path after join to ensure still within bounds
+      if (!safePath(newFullPath)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'Access Denied' }));
+        return;
+      }
       fs.renameSync(resolvedOldPath, newFullPath);
       sendJSON(res, { success: true });
     } catch (e) {
@@ -812,8 +1629,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   
-  // API: Create directory
+  // API: Create directory (deprecated - use /api/v1/files/{path} PUT)
   if (pathname === '/api/mkdir' && req.method === 'POST') {
+    res.setHeader('Deprecation', 'true');
+    res.setHeader('X-Deprecation-Warning', 'Use /api/v1/files/{path} with PUT method instead');
+    
     let body = '';
     for await (const chunk of req) body += chunk;
     const { path: dirPath, name } = JSON.parse(body);
@@ -824,8 +1644,16 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     
+    // Sanitize folder name to prevent directory traversal and injection
+    const sanitizedFolderName = sanitizeFilename(name);
+    if (!sanitizedFolderName) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: 'Invalid folder name' }));
+      return;
+    }
+    
     try {
-      fs.mkdirSync(path.join(resolvedDirPath, name));
+      fs.mkdirSync(path.join(resolvedDirPath, sanitizedFolderName));
       sendJSON(res, { success: true });
     } catch (e) {
       sendJSON(res, { success: false, error: e.message });
@@ -833,8 +1661,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   
-  // API: List files
+  // API: List files (deprecated - use /api/v1/files/{path})
   if (pathname === '/api/files') {
+    res.setHeader('Deprecation', 'true');
+    res.setHeader('X-Deprecation-Warning', 'Use /api/v1/files/{path} instead');
+    
     const query = url.parse(req.url, true).query;
     const reqPath = query.path || '/';
     const resolvedPath = safePath(reqPath);
@@ -860,9 +1691,63 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404).end('Not Found');
 });
 
-// Start server
+// WebDAV Server Configuration
+if (WEBDAV_ENABLED) {
+  try {
+    // Create simple user manager with our credentials
+    const SimpleUserManager = webdavModule.SimpleUserManager;
+    const userManager = new SimpleUserManager();
+    userManager.addUser(USERNAME, PASSWORD, false);
+    
+    // Create Digest authentication (more secure than Basic)
+    const authManager = new webdavModule.HTTPDigestAuthentication(userManager, 'Shared Files');
+    
+    // Create WebDAV server with root directory
+    const webdavServer = new webdavModule.WebDAVServer({
+      port: WEBDAV_PORT,
+      authManager: authManager,
+      root: ROOT_DIR  // This sets the physical root for file operations
+    });
+    
+    // Start the WebDAV server
+    webdavServer.start(() => {
+      console.log(`WebDAV server started on port ${WEBDAV_PORT}`);
+      console.log(`Mount at: http://localhost:${WEBDAV_PORT}/`);
+    });
+  } catch (err) {
+    console.error('Failed to start WebDAV server:', err.message);
+  }
+}
+
+// Start HTTP server
 server.listen(PORT, () => {
-  console.log('📁 FileBrowser running on http://localhost:' + PORT);
-  console.log('📂 Root directory: ' + ROOT_DIR);
-  console.log('👤 Login: ' + USERNAME + ' / ' + PASSWORD);
+  console.log('\n========================================');
+  console.log('Shared Files Server Started');
+  console.log('========================================');
+  console.log(`Web Interface: http://localhost:${PORT}/`);
+  if (WEBDAV_ENABLED) {
+    console.log(`WebDAV Server:   http://localhost:${WEBDAV_PORT}/`);
+  }
+  console.log(`Root Directory: ${ROOT_DIR}`);
+  console.log('=========================================\n');
+
+  // Mounting instructions
+  if (WEBDAV_ENABLED) {
+    console.log('\nMounting Instructions:\n');
+    console.log('macOS:');
+    console.log('  Command + K → smb://localhost:' + WEBDAV_PORT + '/');
+    console.log('  Or: mount_webdav http://localhost:' + WEBDAV_PORT + '/ /Volumes/shared-files\n');
+
+    console.log('Windows Explorer:');
+    console.log('  This PC → Add a network location');
+    console.log('  URL: http://localhost:' + WEBDAV_PORT + '/\n');
+
+    console.log('Linux (Nautilus):');
+    console.log('  Connect to Server → smb://localhost:' + WEBDAV_PORT + '/\n');
+
+    console.log('Command Line (any OS):');
+    console.log('  mkdir -p ~/mnt/shared-files');
+    console.log('  mount -t webdav http://localhost:' + WEBDAV_PORT + '/ ~/mnt/shared-files \\');
+    console.log('    -o username=' + USERNAME + ',password=' + PASSWORD + '\n');
+  }
 });
